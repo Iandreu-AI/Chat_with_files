@@ -1,85 +1,159 @@
 import os
+import pickle
 import pdfplumber
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog
 from docx import Document
 from openai import OpenAI
+from typing import Dict, Callable, List
+from hashlib import md5
 
-# Configuración de la API de DeepSeek
-API_KEY = "sk-2bbfe7905cae4721a1f3f97af3fbf529"
-BASE_URL = "https://api.deepseek.com/v1/"
-MODEL_NAME = "deepseek-chat"
-MAX_TOKENS = 4000
-CONTEXT_WINDOW = 6000
+# Configuración
+CONFIG = {
+    "api_key": "sk-2bbfe7905cae4721a1f3f97af3fbf529",
+    "base_url": "https://api.deepseek.com/v1/",
+    "model": "deepseek-chat",
+    "max_tokens": 4000,
+    "context_window": 6000,
+    "chunk_size": 1000,
+    "persistence_file": "document_store.pkl"
+}
 
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+client = OpenAI(api_key=CONFIG["api_key"], base_url=CONFIG["base_url"])
 
-def procesar_archivos(ruta_carpeta: str) -> str:
-    """Procesa archivos PDF, DOCX y TXT en una carpeta y consolida su texto."""
-    texto_consolidado = ""
-    extensiones_permitidas = {'.pdf', '.docx', '.txt'}
+# Procesadores de archivos
+FILE_PROCESSORS: Dict[str, Callable[[str], str]] = {
+    '.pdf': lambda path: '\n'.join(p.extract_text() for p in pdfplumber.open(path).pages),
+    '.docx': lambda path: '\n'.join(p.text for p in Document(path).paragraphs),
+    '.txt': lambda path: Path(path).read_text(encoding='utf-8')
+}
 
-    for root_dir, _, files in os.walk(ruta_carpeta):
-        for file in files:
-            ext = os.path.splitext(file)[1].lower()
-            if ext in extensiones_permitidas:
-                ruta_archivo = os.path.join(root_dir, file)
-                print(f"📄 Procesando {ruta_archivo}")
-                if ext == ".pdf":
-                    texto_consolidado += extraer_texto_pdf(ruta_archivo) + "\n"
-                elif ext == ".docx":
-                    texto_consolidado += extraer_texto_docx(ruta_archivo) + "\n"
-                elif ext == ".txt":
-                    texto_consolidado += extraer_texto_txt(ruta_archivo) + "\n"
 
-    return texto_consolidado
+class DocumentStore:
+    """Almacenamiento persistente de chunks de texto"""
 
-def extraer_texto_pdf(ruta_pdf: str) -> str:
-    """Extrae el texto de un archivo PDF."""
-    texto = ""
-    try:
-        with pdfplumber.open(ruta_pdf) as pdf:
-            for pagina in pdf.pages:
-                pagina_texto = pagina.extract_text()
-                if pagina_texto:
-                    texto += pagina_texto + "\n"
-    except Exception as e:
-        print(f"❌ Error al leer {ruta_pdf}: {e}")
-    return texto
+    def __init__(self):
+        self.chunks: List[str] = []
+        self.file_hashes: Dict[str, str] = {}
 
-def extraer_texto_docx(ruta_docx: str) -> str:
-    """Extrae el texto de un archivo DOCX."""
-    texto = ""
-    try:
-        doc = Document(ruta_docx)
-        for parrafo in doc.paragraphs:
-            texto += parrafo.text + "\n"
-    except Exception as e:
-        print(f"❌ Error al leer {ruta_docx}: {e}")
-    return texto
+    def add_document(self, chunks: List[str]):
+        self.chunks.extend(chunks)
 
-def extraer_texto_txt(ruta_txt: str) -> str:
-    """Extrae el texto de un archivo TXT."""
-    texto = ""
-    try:
-        with open(ruta_txt, "r", encoding="utf-8") as file:
-            texto = file.read()
-    except Exception as e:
-        print(f"❌ Error al leer {ruta_txt}: {e}")
-    return texto
+    def save(self):
+        with open(CONFIG["persistence_file"], "wb") as f:
+            pickle.dump((self.chunks, self.file_hashes), f)
 
-def responder_preguntas(pregunta: str) -> str:
-    """Realiza preguntas sobre los documentos analizados y devuelve la respuesta."""
-    try:
-        texto_consolidado = "Tu texto consolidado aquí"
-        contexto = f"Document Context:\n{texto_consolidado}\n\nQuestion: {pregunta}"
-        respuesta = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "Responde solo con base en el contexto proporcionado."},
-                {"role": "user", "content": contexto}
-            ],
-            temperature=0.3,
-            max_tokens=MAX_TOKENS
-        )
-        return respuesta.choices[0].message.content.strip()
-    except Exception as e:
-        raise Exception(f"Error al procesar la respuesta: {e}")
+    @classmethod
+    def load(cls):
+        try:
+            with open(CONFIG["persistence_file"], "rb") as f:
+                chunks, hashes = pickle.load(f)
+            store = cls()
+            store.chunks = chunks
+            store.file_hashes = hashes
+            return store
+        except FileNotFoundError:
+            return cls()
+
+
+def token_count(text: str) -> int:
+    return (len(text.encode('utf-8')) + 3) // 4
+
+
+def chunk_text(text: str) -> List[str]:
+    paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+    chunks, current_chunk, current_size = [], [], 0
+
+    for para in paragraphs:
+        para_size = token_count(para)
+        if current_size + para_size > CONFIG["chunk_size"] and current_chunk:
+            chunks.append('\n'.join(current_chunk))
+            current_chunk, current_size = [], 0
+        current_chunk.append(para)
+        current_size += para_size
+
+    return chunks + ['\n'.join(current_chunk)] if current_chunk else chunks
+
+
+def process_file(file_path: Path, store: DocumentStore) -> None:
+    file_hash = md5(file_path.read_bytes()).hexdigest()
+
+    if file_path.name in store.file_hashes and store.file_hashes[file_path.name] == file_hash:
+        return
+
+    processor = FILE_PROCESSORS.get(file_path.suffix.lower())
+    if not processor:
+        return
+
+    text = processor(str(file_path))
+    store.add_document(chunk_text(text))
+    store.file_hashes[file_path.name] = file_hash
+
+
+def find_relevant_chunks(question: str, store: DocumentStore) -> List[str]:
+    """Busca chunks que contengan palabras clave de la pregunta."""
+    keywords = set(question.lower().split())
+    relevant_chunks = []
+
+    for chunk in store.chunks:
+        chunk_words = set(chunk.lower().split())
+        if keywords & chunk_words:  # Intersección de palabras clave
+            relevant_chunks.append(chunk)
+
+    return relevant_chunks
+
+
+def build_context(question: str, store: DocumentStore) -> str:
+    relevant_chunks = find_relevant_chunks(question, store)
+    context = []
+    remaining_tokens = CONFIG["context_window"] - token_count(question) - 200
+
+    for chunk in relevant_chunks:
+        chunk_tokens = token_count(chunk)
+        if chunk_tokens <= remaining_tokens:
+            context.append(chunk)
+            remaining_tokens -= chunk_tokens
+        else:
+            break
+
+    return "Documentos:\n{}\n\nPregunta: {}".format('\n\n'.join(context), question)
+
+
+def main():
+    store = DocumentStore.load()
+
+    root = tk.Tk()
+    root.withdraw()
+
+    if folder := filedialog.askdirectory(title="Seleccionar carpeta"):
+        for file_path in Path(folder).rglob('*'):
+            if file_path.suffix.lower() in FILE_PROCESSORS:
+                process_file(file_path, store)
+        store.save()
+        print("Procesados {} chunks".format(len(store.chunks)))  # Error corregido aquí
+
+    while (question := input("\nPregunta: ").strip().lower()) != "salir":
+        if not question:
+            continue
+
+        try:
+            context = build_context(question, store)
+            response = client.chat.completions.create(
+                model=CONFIG["model"],
+                messages=[{
+                    "role": "system",
+                    "content": "Responde solo usando los documentos proporcionados o temas de los que se hablen en los documentos. Si el tema que te pregunta el usuario no esta directamente proporcionado en los documentos necesito que llegues a una respuesta basandote solo en lo que te han proporcionado los documentos'."
+                }, {
+                    "role": "user",
+                    "content": context
+                }],
+                temperature=0.3
+            )
+            print("\nRespuesta:", response.choices[0].message.content)
+        except Exception as e:
+            print("Error: {}".format(str(e)))
+
+
+if __name__ == "__main__":
+    main()

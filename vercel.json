@@ -1,19 +1,10 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "api/**/*.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/procesar",
-      "dest": "/api/procesar.py"
-    },
-    {
-      "src": "/api/preguntar",
-      "dest": "/api/preguntar.py"
-    }
-  ]
+  "builds": [{
+    "src": "api/main.py",
+    "use": "@vercel/python"
+  }],
+  "routes": [{
+    "src": "/(.*)",
+    "dest": "api/main.py"
+  }]
 }
